@@ -221,7 +221,7 @@ def enviar_a_google_sheets(datos_gocanvas):
         ]
         filas_a_insertar.append(fila)
 
-    # ── Insertar en Sheets ─────────────────────────────────────────────────────
+    # ── Insertar en Sheets ────────────────────────────────────────────────────
     if filas_a_insertar:
         print(f"\n📤 Insertando {len(filas_a_insertar)} filas en Sheets...")
         hoja.append_rows(filas_a_insertar, value_input_option="USER_ENTERED")
