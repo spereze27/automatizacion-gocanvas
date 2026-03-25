@@ -93,7 +93,7 @@ def parsear_xml_gocanvas(xml_string):
 # ==========================================
 def descargar_imagen_gocanvas(image_id: str):
     """
-    ✅ FIX: GoCanvas expone las imágenes en /values/{id} (no en /apiv2/images/).
+    GoCanvas expone las imágenes en /values/{id}.
     Se autentica con Bearer token igual que el resto de la API.
     """
     url = f"https://www.gocanvas.com/values/{image_id}"
@@ -113,9 +113,13 @@ def descargar_imagen_gocanvas(image_id: str):
 
 def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
     """
-    Sube la imagen al bucket GCS con acceso público y retorna la URL.
-    Ruta en el bucket: gocanvas/{image_id}.jpg
-    Si ya existe, reutiliza la URL sin volver a subir.
+    Sube la imagen al bucket GCS y retorna la URL pública.
+
+    ✅ FIX: Se eliminó blob.make_public() porque el bucket usa Uniform Bucket-Level Access.
+    Con uniform access, la visibilidad pública se controla a nivel de bucket con:
+      gcloud storage buckets add-iam-policy-binding gs://xxml
+        --member=allUsers --role=roles/storage.objectViewer
+    No se necesita ACL por objeto.
     """
     try:
         bucket = storage_client.bucket(GCS_BUCKET_NAME)
@@ -126,11 +130,10 @@ def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
             print(f"   ♻️  Imagen {image_id} ya existe en GCS, reutilizando.")
         else:
             blob.upload_from_string(imagen_bytes, content_type="image/jpeg")
-            blob.make_public()
             print(f"   ✅ Imagen {image_id} subida a GCS.")
 
-        # URL pública directa — Google Sheets puede cargarla sin auth
-        return blob.public_url  # https://storage.googleapis.com/xxml/gocanvas/{id}.jpg
+        # Con uniform access + allUsers objectViewer, esta URL ya es pública
+        return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/gocanvas/{image_id}.jpg"
 
     except Exception as e:
         print(f"   ❌ Error subiendo imagen {image_id} a GCS: {e}")
