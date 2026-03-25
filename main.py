@@ -67,7 +67,13 @@ def parsear_xml_gocanvas(xml_string):
         lista_submissions = []
 
         for submission in root.findall('.//Submission'):
-            fecha = submission.find('Date')
+            fecha           = submission.find('Date')
+            web_token_el    = submission.find('WebAccessToken')  # ✅ extraemos el token
+
+            web_access_token = web_token_el.text if web_token_el is not None else ""
+
+            if not web_access_token:
+                print("⚠️  Submission sin WebAccessToken — imágenes no podrán descargarse.")
 
             valores = {}
             for response in submission.findall('.//Response'):
@@ -77,8 +83,9 @@ def parsear_xml_gocanvas(xml_string):
                     valores[label.text] = value.text if value.text else ""
 
             lista_submissions.append({
-                "fecha":   fecha.text if fecha is not None else "N/A",
-                "valores": valores
+                "fecha":             fecha.text if fecha is not None else "N/A",
+                "web_access_token":  web_access_token,
+                "valores":           valores
             })
 
         print(f"📦 Se procesaron {len(lista_submissions)} envíos del XML.")
@@ -91,20 +98,21 @@ def parsear_xml_gocanvas(xml_string):
 # ==========================================
 # CLOUD STORAGE
 # ==========================================
-def descargar_imagen_gocanvas(image_id: str):
+def descargar_imagen_gocanvas(image_id: str, web_access_token: str):
     """
-    GoCanvas expone las imágenes en /values/{id}.
-    Se autentica con Bearer token igual que el resto de la API.
+    ✅ FIX: Usa ?web_access_token= en lugar de Bearer token.
+    GoCanvas redirige a /login con Bearer, pero acepta el WebAccessToken
+    del submission como parámetro de URL — sin necesidad de sesión de cookie.
     """
-    url = f"https://www.gocanvas.com/values/{image_id}"
-    headers = {"Authorization": f"Bearer {GOCANVAS_API_KEY}"}
+    url = f"https://www.gocanvas.com/values/{image_id}?web_access_token={web_access_token}"
 
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        if resp.status_code == 200:
+        resp = requests.get(url, timeout=30, allow_redirects=True)
+        if resp.status_code == 200 and "text/html" not in resp.headers.get("Content-Type", ""):
             return resp.content
         else:
-            print(f"   ⚠️  No se pudo descargar imagen {image_id}: HTTP {resp.status_code}")
+            content_type = resp.headers.get("Content-Type", "desconocido")
+            print(f"   ⚠️  No se pudo descargar imagen {image_id}: HTTP {resp.status_code} | Content-Type: {content_type}")
             return None
     except Exception as e:
         print(f"   ⚠️  Excepción descargando imagen {image_id}: {e}")
@@ -114,12 +122,7 @@ def descargar_imagen_gocanvas(image_id: str):
 def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
     """
     Sube la imagen al bucket GCS y retorna la URL pública.
-
-    ✅ FIX: Se eliminó blob.make_public() porque el bucket usa Uniform Bucket-Level Access.
-    Con uniform access, la visibilidad pública se controla a nivel de bucket con:
-      gcloud storage buckets add-iam-policy-binding gs://xxml
-        --member=allUsers --role=roles/storage.objectViewer
-    No se necesita ACL por objeto.
+    El bucket xxml tiene allUsers:objectViewer a nivel de bucket (uniform access).
     """
     try:
         bucket = storage_client.bucket(GCS_BUCKET_NAME)
@@ -132,7 +135,6 @@ def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
             blob.upload_from_string(imagen_bytes, content_type="image/jpeg")
             print(f"   ✅ Imagen {image_id} subida a GCS.")
 
-        # Con uniform access + allUsers objectViewer, esta URL ya es pública
         return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/gocanvas/{image_id}.jpg"
 
     except Exception as e:
@@ -140,10 +142,9 @@ def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
         return None
 
 
-def procesar_imagen(storage_client, image_id: str) -> str:
+def procesar_imagen(storage_client, image_id: str, web_access_token: str) -> str:
     """
-    Orquesta: valida ID → descarga de GoCanvas → sube a GCS → retorna =IMAGE().
-    Devuelve "N/A" si cualquier paso falla.
+    Orquesta: valida → descarga con WebAccessToken → sube a GCS → =IMAGE().
     """
     if not image_id or not str(image_id).strip().isdigit():
         return "N/A"
@@ -151,7 +152,7 @@ def procesar_imagen(storage_client, image_id: str) -> str:
     image_id = str(image_id).strip()
     print(f"   🖼️  Procesando imagen ID: {image_id}")
 
-    imagen_bytes = descargar_imagen_gocanvas(image_id)
+    imagen_bytes = descargar_imagen_gocanvas(image_id, web_access_token)
     if not imagen_bytes:
         return "N/A"
 
@@ -197,8 +198,9 @@ def enviar_a_google_sheets(datos_gocanvas):
     filas_a_insertar = []
 
     for idx, sub in enumerate(datos_gocanvas, 1):
-        v = sub["valores"]
-        print(f"\n📝 Procesando submission {idx}/{len(datos_gocanvas)}...")
+        v   = sub["valores"]
+        tok = sub["web_access_token"]  # token único por submission
+        print(f"\n📝 Procesando submission {idx}/{len(datos_gocanvas)} (token: {tok[:8]}...)...")
 
         fila = [
             sub["fecha"],
@@ -214,12 +216,12 @@ def enviar_a_google_sheets(datos_gocanvas):
             v.get("Especificar / Specify",    "N/A"),
             v.get("Result",                   "N/A"),
             v.get("Technician name",          "N/A"),
-            # ── Imágenes: GoCanvas /values/ → GCS público → =IMAGE() ──────────
-            procesar_imagen(storage_client, v.get("General pole photo", "")),
-            procesar_imagen(storage_client, v.get("Top (cables)",       "")),
-            procesar_imagen(storage_client, v.get("Pole base",          "")),
-            procesar_imagen(storage_client, v.get("Issue",              "")),
-            procesar_imagen(storage_client, v.get("Signature",          "")),
+            # ── Imágenes con WebAccessToken → GCS → =IMAGE() ─────────────────
+            procesar_imagen(storage_client, v.get("General pole photo", ""), tok),
+            procesar_imagen(storage_client, v.get("Top (cables)",       ""), tok),
+            procesar_imagen(storage_client, v.get("Pole base",          ""), tok),
+            procesar_imagen(storage_client, v.get("Issue",              ""), tok),
+            procesar_imagen(storage_client, v.get("Signature",          ""), tok),
         ]
         filas_a_insertar.append(fila)
 
