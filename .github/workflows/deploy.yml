@@ -6,7 +6,7 @@ on:
       - main
 
 env:
-  PROJECT_ID: tu-id-de-proyecto-gcp
+  PROJECT_ID: tysa-491218
   REGION: us-central1
   JOB_NAME: sync-gocanvas-job
 

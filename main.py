@@ -4,7 +4,7 @@ import gspread
 import google.auth
 from datetime import datetime
 
-# Variables inyectadas por GitHub / Cloud Run 
+# Variables inyectadas por GitHub / Cloud Run
 GOCANVAS_API_KEY = os.environ.get("GOCANVAS_API_KEY")
 FORM_ID = os.environ.get("FORM_ID")
 NOMBRE_DEL_SHEET = os.environ.get("NOMBRE_DEL_SHEET", "Resultados Site Survey TYSA")
