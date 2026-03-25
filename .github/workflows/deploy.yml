@@ -1,0 +1,49 @@
+name: Deploy to Cloud Run Jobs
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  PROJECT_ID: tu-id-de-proyecto-gcp
+  REGION: us-central1
+  JOB_NAME: sync-gocanvas-job
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      # 1. Autenticar GitHub con GCP
+      - name: Auth GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      # 2. Configurar Docker para subir la imagen a Artifact Registry
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        
+      - name: Configure Docker Auth
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev
+
+      # 3. Construir y empujar imagen a Google Artifact Registry
+      # (Debes crear un repositorio llamado 'cloud-run-source-deploy' en GCP Artifact Registry antes)
+      - name: Build and Push Docker image
+        run: |
+          IMAGE_NAME=$REGION-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$JOB_NAME:${{ github.sha }}
+          docker build -t $IMAGE_NAME .
+          docker push $IMAGE_NAME
+
+      # 4. Crear o actualizar el Cloud Run Job
+      - name: Deploy Cloud Run Job
+        run: |
+          IMAGE_NAME=$REGION-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$JOB_NAME:${{ github.sha }}
+          gcloud run jobs deploy $JOB_NAME \
+            --image $IMAGE_NAME \
+            --region $REGION \
+            --set-env-vars GOCANVAS_API_KEY=${{ secrets.GOCANVAS_API_KEY }},FORM_ID=${{ secrets.FORM_ID }},NOMBRE_DEL_SHEET="${{ secrets.NOMBRE_DEL_SHEET }}"
