@@ -123,3 +123,5 @@ def enviar_a_google_sheets(datos_gocanvas):
     if filas_a_insertar:
         hoja.append_rows(filas_a_insertar)
         print(f"✅ Se insertaron {len(filas_a_insertar)} filas en Google Sheets.")
+if __name__ == "__main__":
+    main()
