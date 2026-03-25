@@ -2,25 +2,36 @@ import os
 import requests
 import gspread
 import google.auth
+from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
 
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
-GOCANVAS_API_KEY = os.environ.get("GOCANVAS_API_KEY")
-FORM_ID          = os.environ.get("FORM_ID")
-SPREADSHEET_ID   = "18ArHdNLJYbWf_EKF4rHIXekZ3MHAsa0oJyyUBfoByrg"
-USERNAME         = "jsalazar@tysallc.com"
+GOCANVAS_API_KEY  = os.environ.get("GOCANVAS_API_KEY")
+GOCANVAS_PASSWORD = os.environ.get("GOCANVAS_PASSWORD")
+FORM_ID           = os.environ.get("FORM_ID")
+SPREADSHEET_ID    = "18ArHdNLJYbWf_EKF4rHIXekZ3MHAsa0oJyyUBfoByrg"
+USERNAME          = "jsalazar@tysallc.com"
+GCS_BUCKET_NAME   = "xxml"
+
+# Columna A = Submission ID (índice 0)
+# Esto permite detectar duplicados leyendo solo esa columna
+COL_SUBMISSION_ID = 0
 
 # ==========================================
 # MAIN
 # ==========================================
 def main():
-    print("🚀 Iniciando Job: Sincronización GoCanvas -> Google Sheets")
+    print("🚀 Iniciando Job: Sincronización GoCanvas (XML + Imágenes) -> Google Sheets")
 
     if not GOCANVAS_API_KEY or not FORM_ID:
         print("❌ Error: Faltan variables GOCANVAS_API_KEY o FORM_ID.")
+        return
+
+    if not GOCANVAS_PASSWORD:
+        print("❌ Error: Falta variable GOCANVAS_PASSWORD.")
         return
 
     datos = obtener_submissions_gocanvas()
@@ -65,6 +76,7 @@ def parsear_xml_gocanvas(xml_string):
         lista_submissions = []
 
         for submission in root.findall('.//Submission'):
+            # ✅ Extraer Submission ID del atributo Id="253944490"
             submission_id = submission.get('Id', 'N/A')
             fecha         = submission.find('Date')
 
@@ -88,27 +100,83 @@ def parsear_xml_gocanvas(xml_string):
         return []
 
 
-def link_imagen(image_id: str) -> str:
-    """
-    Retorna el link directo de GoCanvas para la imagen.
-    El usuario debe estar logueado en GoCanvas para verla.
-    """
+# ==========================================
+# CLOUD STORAGE
+# ==========================================
+def descargar_imagen_gocanvas(image_id: str):
+    """Basic Auth — único método que funciona para /values/{id}."""
+    url = f"https://www.gocanvas.com/values/{image_id}"
+
+    try:
+        resp = requests.get(
+            url,
+            auth=(USERNAME, GOCANVAS_PASSWORD),
+            timeout=30,
+            allow_redirects=True
+        )
+        content_type = resp.headers.get("Content-Type", "")
+
+        if resp.status_code == 200 and "image" in content_type:
+            print(f"   ✅ Imagen {image_id} descargada ({len(resp.content)} bytes)")
+            return resp.content
+        else:
+            print(f"   ⚠️  No se pudo descargar imagen {image_id}: HTTP {resp.status_code} | {content_type}")
+            return None
+    except Exception as e:
+        print(f"   ⚠️  Excepción descargando imagen {image_id}: {e}")
+        return None
+
+
+def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
+    """Sube al bucket público — no usa make_public() (uniform access)."""
+    try:
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        blob_name = f"gocanvas/{image_id}.jpg"
+        blob = bucket.blob(blob_name)
+
+        if blob.exists():
+            print(f"   ♻️  Imagen {image_id} ya existe en GCS, reutilizando.")
+        else:
+            blob.upload_from_string(imagen_bytes, content_type="image/jpeg")
+            print(f"   ✅ Imagen {image_id} subida a GCS.")
+
+        return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/gocanvas/{image_id}.jpg"
+    except Exception as e:
+        print(f"   ❌ Error subiendo imagen {image_id} a GCS: {e}")
+        return None
+
+
+def procesar_imagen(storage_client, image_id: str) -> str:
     if not image_id or not str(image_id).strip().isdigit():
         return "N/A"
-    return f"https://www.gocanvas.com/values/{image_id.strip()}"
+
+    image_id = str(image_id).strip()
+    print(f"   🖼️  Procesando imagen ID: {image_id}")
+
+    imagen_bytes = descargar_imagen_gocanvas(image_id)
+    if not imagen_bytes:
+        return "N/A"
+
+    url_publica = subir_imagen_a_gcs(storage_client, image_id, imagen_bytes)
+    if not url_publica:
+        return "N/A"
+
+    return f'=IMAGE("{url_publica}")'
 
 
 # ==========================================
 # GOOGLE SHEETS
 # ==========================================
 def obtener_ids_existentes(hoja) -> set:
-    """Lee columna A (Submission ID) para evitar duplicados."""
+    """
+    Lee la columna A del Sheet (Submission ID) y retorna un set
+    con todos los IDs ya registrados. Así evitamos duplicados.
+    """
     try:
-        ids_col = hoja.col_values(1)
-        ids_existentes = {
-            v.strip() for v in ids_col
-            if v.strip() and v.strip() != "Submission ID"
-        }
+        # Leer solo la columna A (col 1) — mucho más rápido que leer todo el sheet
+        ids_col = hoja.col_values(1)  # col 1 = columna A
+        # Ignorar el header si existe y filtrar vacíos
+        ids_existentes = {v.strip() for v in ids_col if v.strip() and v.strip() != "Submission ID"}
         print(f"🔍 IDs ya existentes en el Sheet: {len(ids_existentes)}")
         return ids_existentes
     except Exception as e:
@@ -123,8 +191,13 @@ def enviar_a_google_sheets(datos_gocanvas):
     credentials, project = google.auth.default(scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/devstorage.read_write",
     ])
     print(f"✅ Proyecto activo: {project}")
+
+    # ── Cliente Cloud Storage ──────────────────────────────────────────────────
+    storage_client = storage.Client(credentials=credentials, project=project)
+    print(f"🪣 Bucket GCS: {GCS_BUCKET_NAME}")
 
     # ── Cliente Google Sheets ──────────────────────────────────────────────────
     cliente_google = gspread.authorize(credentials)
@@ -147,9 +220,9 @@ def enviar_a_google_sheets(datos_gocanvas):
         if sub["submission_id"] not in ids_existentes
     ]
 
-    total    = len(datos_gocanvas)
-    nuevos   = len(submissions_nuevos)
-    omitidos = total - nuevos
+    total     = len(datos_gocanvas)
+    nuevos    = len(submissions_nuevos)
+    omitidos  = total - nuevos
 
     print(f"\n📊 Resumen: {total} en GoCanvas | {omitidos} ya existían | {nuevos} nuevos a insertar")
 
@@ -157,15 +230,15 @@ def enviar_a_google_sheets(datos_gocanvas):
         print("✅ No hay registros nuevos. Job finalizado sin cambios.")
         return
 
-    # ── Construir filas ────────────────────────────────────────────────────────
+    # ── Construir filas solo con submissions nuevos ────────────────────────────
     filas_a_insertar = []
 
     for idx, sub in enumerate(submissions_nuevos, 1):
         v = sub["valores"]
-        print(f"📝 Procesando submission {idx}/{nuevos} (ID: {sub['submission_id']})...")
+        print(f"\n📝 Procesando submission {idx}/{nuevos} (ID: {sub['submission_id']})...")
 
         fila = [
-            sub["submission_id"],
+            sub["submission_id"],              # ✅ Col A — usado para deduplicación
             sub["fecha"],
             v.get("Pole ID",                  "N/A"),
             v.get("Lattitude",                "N/A"),
@@ -179,19 +252,19 @@ def enviar_a_google_sheets(datos_gocanvas):
             v.get("Especificar / Specify",    "N/A"),
             v.get("Result",                   "N/A"),
             v.get("Technician name",          "N/A"),
-            # ── Links directos de GoCanvas (requiere login) ───────────────────
-            link_imagen(v.get("General pole photo", "")),
-            link_imagen(v.get("Top (cables)",       "")),
-            link_imagen(v.get("Pole base",          "")),
-            link_imagen(v.get("Issue",              "")),
-            link_imagen(v.get("Signature",          "")),
+            # ── Imágenes: Basic Auth → GCS → =IMAGE() ────────────────────────
+            procesar_imagen(storage_client, v.get("General pole photo", "")),
+            procesar_imagen(storage_client, v.get("Top (cables)",       "")),
+            procesar_imagen(storage_client, v.get("Pole base",          "")),
+            procesar_imagen(storage_client, v.get("Issue",              "")),
+            procesar_imagen(storage_client, v.get("Signature",          "")),
         ]
         filas_a_insertar.append(fila)
 
     # ── Insertar en Sheets ─────────────────────────────────────────────────────
-    print(f"\n📤 Insertando {len(filas_a_insertar)} filas en Sheets...")
+    print(f"\n📤 Insertando {len(filas_a_insertar)} filas nuevas en Sheets...")
     hoja.append_rows(filas_a_insertar, value_input_option="USER_ENTERED")
-    print(f"✅ ÉXITO: {len(filas_a_insertar)} registros añadidos.")
+    print(f"✅ ÉXITO: {len(filas_a_insertar)} registros nuevos añadidos.")
 
 
 if __name__ == "__main__":
