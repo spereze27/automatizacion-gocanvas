@@ -10,11 +10,15 @@ import xml.etree.ElementTree as ET
 # CONFIGURACIÓN
 # ==========================================
 GOCANVAS_API_KEY  = os.environ.get("GOCANVAS_API_KEY")
-GOCANVAS_PASSWORD = os.environ.get("GOCANVAS_PASSWORD")   # ✅ Basic Auth password
+GOCANVAS_PASSWORD = os.environ.get("GOCANVAS_PASSWORD")
 FORM_ID           = os.environ.get("FORM_ID")
 SPREADSHEET_ID    = "18ArHdNLJYbWf_EKF4rHIXekZ3MHAsa0oJyyUBfoByrg"
 USERNAME          = "jsalazar@tysallc.com"
 GCS_BUCKET_NAME   = "xxml"
+
+# Columna A = Submission ID (índice 0)
+# Esto permite detectar duplicados leyendo solo esa columna
+COL_SUBMISSION_ID = 0
 
 # ==========================================
 # MAIN
@@ -30,20 +34,20 @@ def main():
         print("❌ Error: Falta variable GOCANVAS_PASSWORD.")
         return
 
-    datos_hoy = obtener_submissions_gocanvas()
+    datos = obtener_submissions_gocanvas()
 
-    if not datos_hoy:
-        print("Empty: No se encontraron envíos nuevos en el rango de fechas.")
+    if not datos:
+        print("Empty: No se encontraron envíos en el rango de fechas.")
         return
 
     try:
-        enviar_a_google_sheets(datos_hoy)
+        enviar_a_google_sheets(datos)
     except Exception as e:
         print(f"❌ Error crítico en Sheets: {type(e).__name__} - {str(e)}")
 
 
 # ==========================================
-# GOCANVAS — obtener submissions via XML
+# GOCANVAS
 # ==========================================
 def obtener_submissions_gocanvas():
     hoy_utc = datetime.now(timezone.utc)
@@ -72,7 +76,9 @@ def parsear_xml_gocanvas(xml_string):
         lista_submissions = []
 
         for submission in root.findall('.//Submission'):
-            fecha = submission.find('Date')
+            # ✅ Extraer Submission ID del atributo Id="253944490"
+            submission_id = submission.get('Id', 'N/A')
+            fecha         = submission.find('Date')
 
             valores = {}
             for response in submission.findall('.//Response'):
@@ -82,11 +88,12 @@ def parsear_xml_gocanvas(xml_string):
                     valores[label.text] = value.text if value.text else ""
 
             lista_submissions.append({
-                "fecha":   fecha.text if fecha is not None else "N/A",
-                "valores": valores
+                "submission_id": submission_id,
+                "fecha":         fecha.text if fecha is not None else "N/A",
+                "valores":       valores
             })
 
-        print(f"📦 Se procesaron {len(lista_submissions)} envíos del XML.")
+        print(f"📦 Se encontraron {len(lista_submissions)} envíos en GoCanvas.")
         return lista_submissions
     except Exception as e:
         print(f"❌ Error parseando XML: {e}")
@@ -96,41 +103,32 @@ def parsear_xml_gocanvas(xml_string):
 # ==========================================
 # CLOUD STORAGE
 # ==========================================
-def descargar_imagen_gocanvas(image_id: str) -> bytes | None:
-    """
-    ✅ Basic Auth con usuario:password — único método que funciona
-    para descargar imágenes desde /values/{id} en GoCanvas.
-    Bearer token y WebAccessToken no sirven para este endpoint.
-    """
+def descargar_imagen_gocanvas(image_id: str):
+    """Basic Auth — único método que funciona para /values/{id}."""
     url = f"https://www.gocanvas.com/values/{image_id}"
 
     try:
         resp = requests.get(
             url,
-            auth=(USERNAME, GOCANVAS_PASSWORD),  # Basic Auth
+            auth=(USERNAME, GOCANVAS_PASSWORD),
             timeout=30,
             allow_redirects=True
         )
-
         content_type = resp.headers.get("Content-Type", "")
 
         if resp.status_code == 200 and "image" in content_type:
             print(f"   ✅ Imagen {image_id} descargada ({len(resp.content)} bytes)")
             return resp.content
         else:
-            print(f"   ⚠️  No se pudo descargar imagen {image_id}: HTTP {resp.status_code} | Content-Type: {content_type}")
+            print(f"   ⚠️  No se pudo descargar imagen {image_id}: HTTP {resp.status_code} | {content_type}")
             return None
     except Exception as e:
         print(f"   ⚠️  Excepción descargando imagen {image_id}: {e}")
         return None
 
 
-def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes) -> str | None:
-    """
-    Sube la imagen al bucket GCS.
-    El bucket xxml tiene allUsers:objectViewer — URL pública sin auth.
-    No se usa make_public() porque el bucket tiene Uniform Bucket-Level Access.
-    """
+def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
+    """Sube al bucket público — no usa make_public() (uniform access)."""
     try:
         bucket = storage_client.bucket(GCS_BUCKET_NAME)
         blob_name = f"gocanvas/{image_id}.jpg"
@@ -143,17 +141,12 @@ def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes) -> st
             print(f"   ✅ Imagen {image_id} subida a GCS.")
 
         return f"https://storage.googleapis.com/{GCS_BUCKET_NAME}/gocanvas/{image_id}.jpg"
-
     except Exception as e:
         print(f"   ❌ Error subiendo imagen {image_id} a GCS: {e}")
         return None
 
 
 def procesar_imagen(storage_client, image_id: str) -> str:
-    """
-    Orquesta: valida → descarga con Basic Auth → sube a GCS → retorna =IMAGE().
-    Devuelve "N/A" si cualquier paso falla.
-    """
     if not image_id or not str(image_id).strip().isdigit():
         return "N/A"
 
@@ -174,6 +167,23 @@ def procesar_imagen(storage_client, image_id: str) -> str:
 # ==========================================
 # GOOGLE SHEETS
 # ==========================================
+def obtener_ids_existentes(hoja) -> set:
+    """
+    Lee la columna A del Sheet (Submission ID) y retorna un set
+    con todos los IDs ya registrados. Así evitamos duplicados.
+    """
+    try:
+        # Leer solo la columna A (col 1) — mucho más rápido que leer todo el sheet
+        ids_col = hoja.col_values(1)  # col 1 = columna A
+        # Ignorar el header si existe y filtrar vacíos
+        ids_existentes = {v.strip() for v in ids_col if v.strip() and v.strip() != "Submission ID"}
+        print(f"🔍 IDs ya existentes en el Sheet: {len(ids_existentes)}")
+        return ids_existentes
+    except Exception as e:
+        print(f"⚠️  No se pudo leer IDs existentes: {e}. Se procederá sin filtro.")
+        return set()
+
+
 def enviar_a_google_sheets(datos_gocanvas):
 
     # ── Autenticación ADC ──────────────────────────────────────────────────────
@@ -202,14 +212,33 @@ def enviar_a_google_sheets(datos_gocanvas):
     hoja = spreadsheet.get_worksheet(0)
     print(f"✅ Hoja abierta: '{hoja.title}'")
 
-    # ── Construir filas procesando imágenes ───────────────────────────────────
+    # ── Filtrar duplicados ─────────────────────────────────────────────────────
+    ids_existentes = obtener_ids_existentes(hoja)
+
+    submissions_nuevos = [
+        sub for sub in datos_gocanvas
+        if sub["submission_id"] not in ids_existentes
+    ]
+
+    total     = len(datos_gocanvas)
+    nuevos    = len(submissions_nuevos)
+    omitidos  = total - nuevos
+
+    print(f"\n📊 Resumen: {total} en GoCanvas | {omitidos} ya existían | {nuevos} nuevos a insertar")
+
+    if not submissions_nuevos:
+        print("✅ No hay registros nuevos. Job finalizado sin cambios.")
+        return
+
+    # ── Construir filas solo con submissions nuevos ────────────────────────────
     filas_a_insertar = []
 
-    for idx, sub in enumerate(datos_gocanvas, 1):
+    for idx, sub in enumerate(submissions_nuevos, 1):
         v = sub["valores"]
-        print(f"\n📝 Procesando submission {idx}/{len(datos_gocanvas)}...")
+        print(f"\n📝 Procesando submission {idx}/{nuevos} (ID: {sub['submission_id']})...")
 
         fila = [
+            sub["submission_id"],              # ✅ Col A — usado para deduplicación
             sub["fecha"],
             v.get("Pole ID",                  "N/A"),
             v.get("Lattitude",                "N/A"),
@@ -223,7 +252,7 @@ def enviar_a_google_sheets(datos_gocanvas):
             v.get("Especificar / Specify",    "N/A"),
             v.get("Result",                   "N/A"),
             v.get("Technician name",          "N/A"),
-            # ── Imágenes: Basic Auth → GCS público → =IMAGE() ────────────────
+            # ── Imágenes: Basic Auth → GCS → =IMAGE() ────────────────────────
             procesar_imagen(storage_client, v.get("General pole photo", "")),
             procesar_imagen(storage_client, v.get("Top (cables)",       "")),
             procesar_imagen(storage_client, v.get("Pole base",          "")),
@@ -233,12 +262,9 @@ def enviar_a_google_sheets(datos_gocanvas):
         filas_a_insertar.append(fila)
 
     # ── Insertar en Sheets ─────────────────────────────────────────────────────
-    if filas_a_insertar:
-        print(f"\n📤 Insertando {len(filas_a_insertar)} filas en Sheets...")
-        hoja.append_rows(filas_a_insertar, value_input_option="USER_ENTERED")
-        print(f"✅ ÉXITO: {len(filas_a_insertar)} registros con imágenes añadidos.")
-    else:
-        print("⚠️  No hay filas para insertar.")
+    print(f"\n📤 Insertando {len(filas_a_insertar)} filas nuevas en Sheets...")
+    hoja.append_rows(filas_a_insertar, value_input_option="USER_ENTERED")
+    print(f"✅ ÉXITO: {len(filas_a_insertar)} registros nuevos añadidos.")
 
 
 if __name__ == "__main__":
