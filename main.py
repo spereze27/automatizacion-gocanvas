@@ -9,11 +9,12 @@ import xml.etree.ElementTree as ET
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
-GOCANVAS_API_KEY = os.environ.get("GOCANVAS_API_KEY")
-FORM_ID = os.environ.get("FORM_ID")
-SPREADSHEET_ID = "18ArHdNLJYbWf_EKF4rHIXekZ3MHAsa0oJyyUBfoByrg"
-USERNAME = "jsalazar@tysallc.com"
-GCS_BUCKET_NAME = "xxml"
+GOCANVAS_API_KEY  = os.environ.get("GOCANVAS_API_KEY")
+GOCANVAS_PASSWORD = os.environ.get("GOCANVAS_PASSWORD")   # ✅ Basic Auth password
+FORM_ID           = os.environ.get("FORM_ID")
+SPREADSHEET_ID    = "18ArHdNLJYbWf_EKF4rHIXekZ3MHAsa0oJyyUBfoByrg"
+USERNAME          = "jsalazar@tysallc.com"
+GCS_BUCKET_NAME   = "xxml"
 
 # ==========================================
 # MAIN
@@ -23,6 +24,10 @@ def main():
 
     if not GOCANVAS_API_KEY or not FORM_ID:
         print("❌ Error: Faltan variables GOCANVAS_API_KEY o FORM_ID.")
+        return
+
+    if not GOCANVAS_PASSWORD:
+        print("❌ Error: Falta variable GOCANVAS_PASSWORD.")
         return
 
     datos_hoy = obtener_submissions_gocanvas()
@@ -38,7 +43,7 @@ def main():
 
 
 # ==========================================
-# GOCANVAS
+# GOCANVAS — obtener submissions via XML
 # ==========================================
 def obtener_submissions_gocanvas():
     hoy_utc = datetime.now(timezone.utc)
@@ -67,13 +72,7 @@ def parsear_xml_gocanvas(xml_string):
         lista_submissions = []
 
         for submission in root.findall('.//Submission'):
-            fecha           = submission.find('Date')
-            web_token_el    = submission.find('WebAccessToken')  # ✅ extraemos el token
-
-            web_access_token = web_token_el.text if web_token_el is not None else ""
-
-            if not web_access_token:
-                print("⚠️  Submission sin WebAccessToken — imágenes no podrán descargarse.")
+            fecha = submission.find('Date')
 
             valores = {}
             for response in submission.findall('.//Response'):
@@ -83,9 +82,8 @@ def parsear_xml_gocanvas(xml_string):
                     valores[label.text] = value.text if value.text else ""
 
             lista_submissions.append({
-                "fecha":             fecha.text if fecha is not None else "N/A",
-                "web_access_token":  web_access_token,
-                "valores":           valores
+                "fecha":   fecha.text if fecha is not None else "N/A",
+                "valores": valores
             })
 
         print(f"📦 Se procesaron {len(lista_submissions)} envíos del XML.")
@@ -98,20 +96,28 @@ def parsear_xml_gocanvas(xml_string):
 # ==========================================
 # CLOUD STORAGE
 # ==========================================
-def descargar_imagen_gocanvas(image_id: str, web_access_token: str):
+def descargar_imagen_gocanvas(image_id: str) -> bytes | None:
     """
-    ✅ FIX: Usa ?web_access_token= en lugar de Bearer token.
-    GoCanvas redirige a /login con Bearer, pero acepta el WebAccessToken
-    del submission como parámetro de URL — sin necesidad de sesión de cookie.
+    ✅ Basic Auth con usuario:password — único método que funciona
+    para descargar imágenes desde /values/{id} en GoCanvas.
+    Bearer token y WebAccessToken no sirven para este endpoint.
     """
-    url = f"https://www.gocanvas.com/values/{image_id}?web_access_token={web_access_token}"
+    url = f"https://www.gocanvas.com/values/{image_id}"
 
     try:
-        resp = requests.get(url, timeout=30, allow_redirects=True)
-        if resp.status_code == 200 and "text/html" not in resp.headers.get("Content-Type", ""):
+        resp = requests.get(
+            url,
+            auth=(USERNAME, GOCANVAS_PASSWORD),  # Basic Auth
+            timeout=30,
+            allow_redirects=True
+        )
+
+        content_type = resp.headers.get("Content-Type", "")
+
+        if resp.status_code == 200 and "image" in content_type:
+            print(f"   ✅ Imagen {image_id} descargada ({len(resp.content)} bytes)")
             return resp.content
         else:
-            content_type = resp.headers.get("Content-Type", "desconocido")
             print(f"   ⚠️  No se pudo descargar imagen {image_id}: HTTP {resp.status_code} | Content-Type: {content_type}")
             return None
     except Exception as e:
@@ -119,10 +125,11 @@ def descargar_imagen_gocanvas(image_id: str, web_access_token: str):
         return None
 
 
-def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
+def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes) -> str | None:
     """
-    Sube la imagen al bucket GCS y retorna la URL pública.
-    El bucket xxml tiene allUsers:objectViewer a nivel de bucket (uniform access).
+    Sube la imagen al bucket GCS.
+    El bucket xxml tiene allUsers:objectViewer — URL pública sin auth.
+    No se usa make_public() porque el bucket tiene Uniform Bucket-Level Access.
     """
     try:
         bucket = storage_client.bucket(GCS_BUCKET_NAME)
@@ -142,9 +149,10 @@ def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
         return None
 
 
-def procesar_imagen(storage_client, image_id: str, web_access_token: str) -> str:
+def procesar_imagen(storage_client, image_id: str) -> str:
     """
-    Orquesta: valida → descarga con WebAccessToken → sube a GCS → =IMAGE().
+    Orquesta: valida → descarga con Basic Auth → sube a GCS → retorna =IMAGE().
+    Devuelve "N/A" si cualquier paso falla.
     """
     if not image_id or not str(image_id).strip().isdigit():
         return "N/A"
@@ -152,7 +160,7 @@ def procesar_imagen(storage_client, image_id: str, web_access_token: str) -> str
     image_id = str(image_id).strip()
     print(f"   🖼️  Procesando imagen ID: {image_id}")
 
-    imagen_bytes = descargar_imagen_gocanvas(image_id, web_access_token)
+    imagen_bytes = descargar_imagen_gocanvas(image_id)
     if not imagen_bytes:
         return "N/A"
 
@@ -198,9 +206,8 @@ def enviar_a_google_sheets(datos_gocanvas):
     filas_a_insertar = []
 
     for idx, sub in enumerate(datos_gocanvas, 1):
-        v   = sub["valores"]
-        tok = sub["web_access_token"]  # token único por submission
-        print(f"\n📝 Procesando submission {idx}/{len(datos_gocanvas)} (token: {tok[:8]}...)...")
+        v = sub["valores"]
+        print(f"\n📝 Procesando submission {idx}/{len(datos_gocanvas)}...")
 
         fila = [
             sub["fecha"],
@@ -216,12 +223,12 @@ def enviar_a_google_sheets(datos_gocanvas):
             v.get("Especificar / Specify",    "N/A"),
             v.get("Result",                   "N/A"),
             v.get("Technician name",          "N/A"),
-            # ── Imágenes con WebAccessToken → GCS → =IMAGE() ─────────────────
-            procesar_imagen(storage_client, v.get("General pole photo", ""), tok),
-            procesar_imagen(storage_client, v.get("Top (cables)",       ""), tok),
-            procesar_imagen(storage_client, v.get("Pole base",          ""), tok),
-            procesar_imagen(storage_client, v.get("Issue",              ""), tok),
-            procesar_imagen(storage_client, v.get("Signature",          ""), tok),
+            # ── Imágenes: Basic Auth → GCS público → =IMAGE() ────────────────
+            procesar_imagen(storage_client, v.get("General pole photo", "")),
+            procesar_imagen(storage_client, v.get("Top (cables)",       "")),
+            procesar_imagen(storage_client, v.get("Pole base",          "")),
+            procesar_imagen(storage_client, v.get("Issue",              "")),
+            procesar_imagen(storage_client, v.get("Signature",          "")),
         ]
         filas_a_insertar.append(fila)
 
