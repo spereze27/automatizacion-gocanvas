@@ -2,7 +2,6 @@ import os
 import requests
 import gspread
 import google.auth
-import google.auth.transport.requests
 from google.cloud import storage
 from datetime import datetime, timedelta, timezone
 import xml.etree.ElementTree as ET
@@ -90,14 +89,14 @@ def parsear_xml_gocanvas(xml_string):
 
 
 # ==========================================
-# CLOUD STORAGE — descarga desde GoCanvas y sube al bucket
+# CLOUD STORAGE
 # ==========================================
 def descargar_imagen_gocanvas(image_id: str):
     """
-    Descarga la imagen desde GoCanvas usando Bearer token.
-    Endpoint: /apiv2/images/{id}.jpg  (autenticado con el mismo token de la API)
+    ✅ FIX: GoCanvas expone las imágenes en /values/{id} (no en /apiv2/images/).
+    Se autentica con Bearer token igual que el resto de la API.
     """
-    url = f"https://www.gocanvas.com/apiv2/images/{image_id}.jpg"
+    url = f"https://www.gocanvas.com/values/{image_id}"
     headers = {"Authorization": f"Bearer {GOCANVAS_API_KEY}"}
 
     try:
@@ -130,7 +129,7 @@ def subir_imagen_a_gcs(storage_client, image_id: str, imagen_bytes: bytes):
             blob.make_public()
             print(f"   ✅ Imagen {image_id} subida a GCS.")
 
-        # URL pública directa: Google Sheets puede cargarla sin auth
+        # URL pública directa — Google Sheets puede cargarla sin auth
         return blob.public_url  # https://storage.googleapis.com/xxml/gocanvas/{id}.jpg
 
     except Exception as e:
@@ -212,7 +211,7 @@ def enviar_a_google_sheets(datos_gocanvas):
             v.get("Especificar / Specify",    "N/A"),
             v.get("Result",                   "N/A"),
             v.get("Technician name",          "N/A"),
-            # ── Imágenes: GoCanvas → GCS → =IMAGE() ──────────────────────────
+            # ── Imágenes: GoCanvas /values/ → GCS público → =IMAGE() ──────────
             procesar_imagen(storage_client, v.get("General pole photo", "")),
             procesar_imagen(storage_client, v.get("Top (cables)",       "")),
             procesar_imagen(storage_client, v.get("Pole base",          "")),
@@ -221,7 +220,7 @@ def enviar_a_google_sheets(datos_gocanvas):
         ]
         filas_a_insertar.append(fila)
 
-    # ── Insertar en Sheets ────────────────────────────────────────────────────
+    # ── Insertar en Sheets ─────────────────────────────────────────────────────
     if filas_a_insertar:
         print(f"\n📤 Insertando {len(filas_a_insertar)} filas en Sheets...")
         hoja.append_rows(filas_a_insertar, value_input_option="USER_ENTERED")
